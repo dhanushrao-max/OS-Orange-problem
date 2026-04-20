@@ -1,241 +1,303 @@
-// commit.c — Commit creation and history traversal
+// object.c — Content-addressable object store
 //
-// Commit object format (stored as text, one field per line):
+// Every piece of data (file contents, directory listings, commits) is stored
+// as an "object" named by its SHA-256 hash. Objects are stored under
+// .pes/objects/XX/YYYYYY... where XX is the first two hex characters of the
+// hash (directory sharding).
 //
-//   tree <64-char-hex-hash>
-//   parent <64-char-hex-hash>        ← omitted for the first commit
-//   author <name> <unix-timestamp>
-//   committer <name> <unix-timestamp>
-//
-//   <commit message>
-//
-// Note: there is a blank line between the headers and the message.
-//
-// PROVIDED functions: commit_parse, commit_serialize, commit_walk, head_read, head_update
-// TODO functions:     commit_create
+// PROVIDED functions: compute_hash, object_path, object_exists, hash_to_hex, hex_to_hash
+// TODO functions:     object_write, object_read
 
-#include "commit.h"
-#include "index.h"
-#include "tree.h"
+#include "pes.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <inttypes.h>
-#include <time.h>
-#include <unistd.h>
+#include <sys/stat.h>
 #include <fcntl.h>
-
-// Forward declarations (implemented in object.c)
-int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
-int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out);
+#include <unistd.h>
+#include <openssl/evp.h>
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
-// Parse raw commit data into a Commit struct.
-int commit_parse(const void *data, size_t len, Commit *commit_out) {
-    (void)len;
-    const char *p = (const char *)data;
+void hash_to_hex(const ObjectID *id, char *hex_out) {
+    for (int i = 0; i < HASH_SIZE; i++) {
+        sprintf(hex_out + i * 2, "%02x", id->hash[i]);
+    }
+    hex_out[HASH_HEX_SIZE] = '\0';
+}
+
+int hex_to_hash(const char *hex, ObjectID *id_out) {
+    if (strlen(hex) < HASH_HEX_SIZE) return -1;
+    for (int i = 0; i < HASH_SIZE; i++) {
+        unsigned int byte;
+        if (sscanf(hex + i * 2, "%2x", &byte) != 1) return -1;
+        id_out->hash[i] = (uint8_t)byte;
+    }
+    return 0;
+}
+
+void compute_hash(const void *data, size_t len, ObjectID *id_out) {
+    unsigned int hash_len;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+    EVP_DigestUpdate(ctx, data, len);
+    EVP_DigestFinal_ex(ctx, id_out->hash, &hash_len);
+    EVP_MD_CTX_free(ctx);
+}
+
+// Get the filesystem path where an object should be stored.
+// Format: .pes/objects/XX/YYYYYYYY...
+// The first 2 hex chars form the shard directory; the rest is the filename.
+void object_path(const ObjectID *id, char *path_out, size_t path_size) {
     char hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(id, hex);
+    snprintf(path_out, path_size, "%s/%.2s/%s", OBJECTS_DIR, hex, hex + 2);
+}
 
-    // "tree <hex>\n"
-    if (sscanf(p, "tree %64s\n", hex) != 1) return -1;
-    if (hex_to_hash(hex, &commit_out->tree) != 0) return -1;
-    p = strchr(p, '\n') + 1;
+int object_exists(const ObjectID *id) {
+    char path[512];
+    object_path(id, path, sizeof(path));
+    return access(path, F_OK) == 0;
+}
 
-    // optional "parent <hex>\n"
-    if (strncmp(p, "parent ", 7) == 0) {
-        if (sscanf(p, "parent %64s\n", hex) != 1) return -1;
-        if (hex_to_hash(hex, &commit_out->parent) != 0) return -1;
-        commit_out->has_parent = 1;
-        p = strchr(p, '\n') + 1;
-    } else {
-        commit_out->has_parent = 0;
+// ─── TODO: Implement these ──────────────────────────────────────────────────
+
+// Write an object to the store.
+//
+// Object format on disk:
+//   "<type> <size>\0<data>"
+//   where <type> is "blob", "tree", or "commit"
+//   and <size> is the decimal string of the data length
+//
+// Steps:
+//   1. Build the full object: header ("blob 16\0") + data
+//   2. Compute SHA-256 hash of the FULL object (header + data)
+//   3. Check if object already exists (deduplication) — if so, just return success
+//   4. Create shard directory (.pes/objects/XX/) if it doesn't exist
+//   5. Write to a temporary file in the same shard directory
+//   6. fsync() the temporary file to ensure data reaches disk
+//   7. rename() the temp file to the final path (atomic on POSIX)
+//   8. Open and fsync() the shard directory to persist the rename
+//   9. Store the computed hash in *id_out
+
+// HINTS - Useful syscalls and functions for this phase:
+//   - sprintf / snprintf : formatting the header string
+//   - compute_hash       : hashing the combined header + data
+//   - object_exists      : checking for deduplication
+//   - mkdir              : creating the shard directory (use mode 0755)
+//   - open, write, close : creating and writing to the temp file
+//                          (Use O_CREAT | O_WRONLY | O_TRUNC, mode 0644)
+//   - fsync              : flushing the file descriptor to disk
+//   - rename             : atomically moving the temp file to the final path
+//
+
+//
+// Returns 0 on success, -1 on error.
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
+    // Step 1: Build the full object: header ("blob 16\0") + data
+    const char *type_str;
+    switch (type) {
+        case OBJ_BLOB:   type_str = "blob"; break;
+        case OBJ_TREE:   type_str = "tree"; break;
+        case OBJ_COMMIT: type_str = "commit"; break;
+        default: return -1;
     }
 
-    // "author <name> <timestamp>\n"
-    char author_buf[256];
-    uint64_t ts;
-    if (sscanf(p, "author %255[^\n]\n", author_buf) != 1) return -1;
-    // split off trailing timestamp
-    char *last_space = strrchr(author_buf, ' ');
-    if (!last_space) return -1;
-    ts = (uint64_t)strtoull(last_space + 1, NULL, 10);
-    *last_space = '\0';
-    snprintf(commit_out->author, sizeof(commit_out->author), "%s", author_buf);
-    commit_out->timestamp = ts;
-    p = strchr(p, '\n') + 1;  // skip author line
-    p = strchr(p, '\n') + 1;  // skip committer line
-    p = strchr(p, '\n') + 1;  // skip blank line
+    // Build header string
+    char header[256];
+    snprintf(header, sizeof(header), "%s %lu", type_str, (unsigned long)len);
+    size_t header_len = strlen(header);
 
-    snprintf(commit_out->message, sizeof(commit_out->message), "%s", p);
+    // Create full object: header + '\0' + data
+    size_t full_len = header_len + 1 + len;
+    void *full_obj = malloc(full_len);
+    if (!full_obj) return -1;
+
+    memcpy(full_obj, header, header_len);
+    ((char *)full_obj)[header_len] = '\0';
+    if (len > 0) memcpy((char *)full_obj + header_len + 1, data, len);
+
+    // Step 2: Compute SHA-256 hash of the FULL object
+    compute_hash(full_obj, full_len, id_out);
+
+    // Step 3: Check if object already exists (deduplication)
+    if (object_exists(id_out)) {
+        free(full_obj);
+        return 0;
+    }
+
+    // Step 4: Create shard directory if it doesn't exist
+    char shard_dir[512];
+    char hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(id_out, hex);
+    snprintf(shard_dir, sizeof(shard_dir), "%s/%.2s", OBJECTS_DIR, hex);
+    mkdir(shard_dir, 0755);
+
+    // Step 5: Write to a temporary file
+    char path[512];
+    object_path(id_out, path, sizeof(path));
+    
+    char tmp_path[520];
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path) >= (int)sizeof(tmp_path)) {
+        free(full_obj);
+        return -1;
+    }
+
+    int fd = open(tmp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        free(full_obj);
+        return -1;
+    }
+
+    if (write(fd, full_obj, full_len) != (ssize_t)full_len) {
+        close(fd);
+        unlink(tmp_path);
+        free(full_obj);
+        return -1;
+    }
+
+    // Step 6: fsync() the temporary file to ensure data reaches disk
+    if (fsync(fd) != 0) {
+        close(fd);
+        unlink(tmp_path);
+        free(full_obj);
+        return -1;
+    }
+    close(fd);
+
+    // Step 7: rename() the temp file to the final path (atomic on POSIX)
+    if (rename(tmp_path, path) != 0) {
+        free(full_obj);
+        return -1;
+    }
+
+    // Step 8: fsync() the shard directory to persist the rename
+    fd = open(shard_dir, O_RDONLY);
+    if (fd >= 0) {
+        fsync(fd);
+        close(fd);
+    }
+
+    free(full_obj);
     return 0;
 }
 
-// Serialize a Commit struct to the text format.
-// Caller must free(*data_out).
-int commit_serialize(const Commit *commit, void **data_out, size_t *len_out) {
-    char tree_hex[HASH_HEX_SIZE + 1];
-    char parent_hex[HASH_HEX_SIZE + 1];
-    hash_to_hex(&commit->tree, tree_hex);
+// Read an object from the store.
+//
+// Steps:
+//   1. Build the file path from the hash using object_path()
+//   2. Open and read the entire file
+//   3. Parse the header to extract the type string and size
+//   4. Verify integrity: recompute the SHA-256 of the file contents
+//      and compare to the expected hash (from *id). Return -1 if mismatch.
+//   5. Set *type_out to the parsed ObjectType
+//   6. Allocate a buffer, copy the data portion (after the \0), set *data_out and *len_out
+//
+// HINTS - Useful syscalls and functions for this phase:
+//   - object_path        : getting the target file path
+//   - fopen, fread, fseek: reading the file into memory
+//   - memchr             : safely finding the '\0' separating header and data
+//   - strncmp            : parsing the type string ("blob", "tree", "commit")
+//   - compute_hash       : re-hashing the read data for integrity verification
+//   - memcmp             : comparing the computed hash against the requested hash
+//   - malloc, memcpy     : allocating and returning the extracted data
+//
+// The caller is responsible for calling free(*data_out).
+// Returns 0 on success, -1 on error (file not found, corrupt, etc.).
+int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
+    char path[512];
+    object_path(id, path, sizeof(path));
 
-    char buf[8192];
-    int n = 0;
-    n += snprintf(buf + n, sizeof(buf) - n, "tree %s\n", tree_hex);
-    if (commit->has_parent) {
-        hash_to_hex(&commit->parent, parent_hex);
-        n += snprintf(buf + n, sizeof(buf) - n, "parent %s\n", parent_hex);
-    }
-    n += snprintf(buf + n, sizeof(buf) - n,
-                  "author %s %" PRIu64 "\n"
-                  "committer %s %" PRIu64 "\n"
-                  "\n"
-                  "%s",
-                  commit->author, commit->timestamp,
-                  commit->author, commit->timestamp,
-                  commit->message);
-
-    *data_out = malloc(n + 1);
-    if (!*data_out) return -1;
-    memcpy(*data_out, buf, n + 1);
-    *len_out = (size_t)n;
-    return 0;
-}
-
-// Walk commit history from HEAD to the root.
-int commit_walk(commit_walk_fn callback, void *ctx) {
-    ObjectID id;
-    if (head_read(&id) != 0) return -1;
-
-    while (1) {
-        ObjectType type;
-        void *raw;
-        size_t raw_len;
-        if (object_read(&id, &type, &raw, &raw_len) != 0) return -1;
-
-        Commit c;
-        int rc = commit_parse(raw, raw_len, &c);
-        free(raw);
-        if (rc != 0) return -1;
-
-        callback(&id, &c, ctx);
-
-        if (!c.has_parent) break;
-        id = c.parent;
-    }
-    return 0;
-}
-
-// Read the current HEAD commit hash.
-int head_read(ObjectID *id_out) {
-    FILE *f = fopen(HEAD_FILE, "r");
+    // Step 1: Open and read the entire file
+    FILE *f = fopen(path, "rb");
     if (!f) return -1;
-    char line[512];
-    if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
-    fclose(f);
-    line[strcspn(line, "\r\n")] = '\0'; // strip newline
 
-    char ref_path[512];
-    if (strncmp(line, "ref: ", 5) == 0) {
-        snprintf(ref_path, sizeof(ref_path), "%s/%s", PES_DIR, line + 5);
-        f = fopen(ref_path, "r");
-        if (!f) return -1; // Branch exists but has no commits yet
-        if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
+    // Read file into memory
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    if (file_size < 0) {
         fclose(f);
-        line[strcspn(line, "\r\n")] = '\0';
+        return -1;
     }
-    return hex_to_hash(line, id_out);
-}
+    fseek(f, 0, SEEK_SET);
 
-// Update the current branch ref to point to a new commit atomically.
-int head_update(const ObjectID *new_commit) {
-    FILE *f = fopen(HEAD_FILE, "r");
-    if (!f) return -1;
-    char line[512];
-    if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
+    void *file_data = malloc(file_size);
+    if (!file_data) {
+        fclose(f);
+        return -1;
+    }
+
+    if (fread(file_data, 1, file_size, f) != (size_t)file_size) {
+        free(file_data);
+        fclose(f);
+        return -1;
+    }
     fclose(f);
-    line[strcspn(line, "\r\n")] = '\0';
 
-    char target_path[520];
-    if (strncmp(line, "ref: ", 5) == 0) {
-        snprintf(target_path, sizeof(target_path), "%s/%s", PES_DIR, line + 5);
-    } else {
-        snprintf(target_path, sizeof(target_path), "%s", HEAD_FILE); // Detached HEAD
-    }
-
-    char tmp_path[528];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", target_path);
-    
-    f = fopen(tmp_path, "w");
-    if (!f) return -1;
-    
-    char hex[HASH_HEX_SIZE + 1];
-    hash_to_hex(new_commit, hex);
-    fprintf(f, "%s\n", hex);
-    
-    fflush(f);
-    fsync(fileno(f));
-    fclose(f);
-    
-    return rename(tmp_path, target_path);
-}
-
-// ─── TODO: Implement these ───────────────────────────────────────────────────
-
-// Helper to get the author string from PES_AUTHOR environment variable
-static void get_author(char *author_buf, size_t size) {
-    const char *env_author = getenv("PES_AUTHOR");
-    if (env_author) {
-        snprintf(author_buf, size, "%s", env_author);
-    } else {
-        snprintf(author_buf, size, "Murali_R <PES2UG25AM805@pes.edu>");
-    }
-}
-
-// Create a new commit from the current staging area.
-int commit_create(const char *message, ObjectID *commit_id_out) {
-    // Step 1: Build a tree from the index
-    ObjectID tree_id;
-    if (tree_from_index(&tree_id) != 0) {
+    // Step 2 & 3: Parse the header and verify integrity
+    // Find the null terminator that separates header and data
+    void *null_ptr = memchr(file_data, '\0', file_size);
+    if (!null_ptr) {
+        free(file_data);
         return -1;
     }
-    
-    // Step 2: Get the parent commit hash (if any)
-    ObjectID parent_id;
-    int has_parent = 0;
-    if (head_read(&parent_id) == 0) {
-        has_parent = 1;
-    }
-    
-    // Step 3: Get author information and timestamp
-    Commit commit = {0};
-    commit.tree = tree_id;
-    commit.has_parent = has_parent;
-    if (has_parent) {
-        commit.parent = parent_id;
-    }
-    get_author(commit.author, sizeof(commit.author));
-    commit.timestamp = time(NULL);
-    snprintf(commit.message, sizeof(commit.message), "%s", message);
-    
-    // Step 4: Serialize the commit
-    void *commit_data;
-    size_t commit_len;
-    if (commit_serialize(&commit, &commit_data, &commit_len) != 0) {
+
+    size_t header_len = (char *)null_ptr - (char *)file_data;
+    char header_str[256];
+    if (header_len >= sizeof(header_str)) {
+        free(file_data);
         return -1;
     }
-    
-    // Step 5: Write the commit object
-    if (object_write(OBJ_COMMIT, commit_data, commit_len, commit_id_out) != 0) {
-        free(commit_data);
+    memcpy(header_str, file_data, header_len);
+    header_str[header_len] = '\0';
+
+    // Parse type and size from header
+    char type_name[32];
+    size_t parsed_size;
+    if (sscanf(header_str, "%31s %zu", type_name, &parsed_size) != 2) {
+        free(file_data);
         return -1;
     }
-    
-    // Step 6: Update HEAD to point to the new commit
-    if (head_update(commit_id_out) != 0) {
-        free(commit_data);
+
+    // Map type string to ObjectType
+    ObjectType type;
+    if (strcmp(type_name, "blob") == 0)       type = OBJ_BLOB;
+    else if (strcmp(type_name, "tree") == 0)  type = OBJ_TREE;
+    else if (strcmp(type_name, "commit") == 0) type = OBJ_COMMIT;
+    else {
+        free(file_data);
         return -1;
     }
-    
-    free(commit_data);
+
+    // Verify that the parsed size matches actual data
+    size_t data_len = file_size - header_len - 1;
+    if (data_len != parsed_size) {
+        free(file_data);
+        return -1;
+    }
+
+    // Verify integrity: recompute SHA-256 and compare
+    ObjectID computed_id;
+    compute_hash(file_data, file_size, &computed_id);
+    if (memcmp(&computed_id, id, sizeof(ObjectID)) != 0) {
+        free(file_data);
+        return -1;  // Hash mismatch - corruption detected
+    }
+
+    // Step 5 & 6: Extract data portion and return it
+    void *data_out_buf = malloc(data_len);
+    if (!data_out_buf) {
+        free(file_data);
+        return -1;
+    }
+    if (data_len > 0) {
+        memcpy(data_out_buf, (char *)file_data + header_len + 1, data_len);
+    }
+
+    *type_out = type;
+    *data_out = data_out_buf;
+    *len_out = data_len;
+
+    free(file_data);
     return 0;
 }
